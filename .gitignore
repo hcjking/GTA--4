@@ -811,3 +811,4 @@ web/*.m4a
 web/*.mov
 web/*.png
 web/*.jpg
+web/dist/

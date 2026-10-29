@@ -9,9 +9,14 @@ button-prompt set
 (rpf_button_prompts.cpp mounts it beside that set's buttons_360.xtd).
 
 Usage: build_controller_diagrams.py <xtd_store binary> <frontend_360.xtd> <out root> [work dir]
-writes <out root>/<variant>/frontend_360.xtd for each variant below.
+writes <out root>/<variant>/frontend_360.xtd for each variant below, and the
+pictures alone, to ship without the game's textures: <variant>/controller.bin
+(the tiled texture) and controller-place.txt (where it goes in the unpacked
+dictionary, and the stock picture's SHA-256), which rpf_button_prompts.cpp
+BuildFrontend writes into the player's own frontend_360.xtd.
 """
 
+import hashlib
 import importlib.util
 import subprocess
 import sys
@@ -74,8 +79,15 @@ def main() -> int:
         return roundtrip.swizzle_dxt5_payload(keyboard.bc3(rgba, record.width, record.height),
                                               record.width, record.height)
 
+    size = record.width * record.height  # (DXT5: a byte a texel)
+    place = out_root / "controller-place.txt"
+    place.parent.mkdir(parents=True, exist_ok=True)
+    place.write_text(f"{at} {hashlib.sha256(base[at:at + size]).hexdigest()}\n")
+    print("wrote", place)
     for variant, style in VARIANTS.items():
         tiled = tiled_picture(style)
+        (out_root / variant).mkdir(parents=True, exist_ok=True)
+        (out_root / variant / "controller.bin").write_bytes(tiled)
         for name, other in SWAPPED.get(variant, {}).items():
             path = out_root / variant / name
             path.parent.mkdir(parents=True, exist_ok=True)

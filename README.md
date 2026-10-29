@@ -9,13 +9,37 @@
 >
 > Go star the original projects and support them.
 
+## Play it
+You need your **own** GTA IV for the **USA Xbox 360**. No game files come with this.
+
+1. **Install** [Python 3](https://www.python.org/downloads/) (on Windows, tick *Add python.exe to PATH*) and **Chrome** or **Edge**.
+2. **Download** `gta4-web-<version>.zip` from [Releases](../../releases) and unzip it.
+3. **Put your game files** in its `game-files` folder:
+   | File | Size |
+   |---|---|
+   | The USA Xbox 360 disc as an `.iso`, for example `Grand Theft Auto IV (USA) (En,Fr,De,Es,It).iso` | 7,835,492,352 bytes |
+   | Title Update 8: `TU_1A581VI_000000K000000.0000000000205` | 3,715,072 bytes |
+4. **Double-click** `Play GTA IV` (`Play GTA IV.command` on a Mac: right-click it and pick *Open* the first time; `Play GTA IV.bat` on Windows). The game opens in your browser at http://localhost:8765/.
+
+The first start installs the game into the browser, which takes a few minutes and about 8 GB of space. After that it starts in seconds. Keep the small window that opens running while you play, and close it to stop.
+
+**Controls:** WASD and the mouse, Enter and Esc in menus, or plug in a controller. **F8** shows the FPS counter, and the buttons in the top right switch to fullscreen.
+
+**Saves** live in your browser. Back them up from the hub's *Saves* page (*Download Saves*), and bring 360 saves over with *Import Xbox 360 Saves*.
+
+### If it doesn't start
+- **Use Chrome or Edge** on a computer with about 8 GB of free memory. Safari, Firefox and iPhone / iPad browsers can't run it yet. While the game's window is open, http://localhost:8765/check.html shows what your browser is missing.
+- **"No disc image found"** means the `.iso` isn't in `game-files`. Only the **USA** Xbox 360 disc works, not PC, PS3 or other editions.
+- **Stuck installing?** Keep the tab in front: browsers slow down background tabs.
+- **Play from another device on your Wi-Fi** (experimental, the server on a Mac for now): start it with `GTA4_WEB_LAN=1 python3 play.py` and open the setup address it prints on the other device, which walks you through trusting the certificate once. Phones and tablets mostly can't run the game yet: check them with `check.html` first.
+
 ## What's in it
 - GTA IV running in Chrome, Edge or another Chromium browser, from WebAssembly (64-bit memory, threads) and WebGPU
 - The game's own Xbox 360 shaders converted to WGSL, with the 360's display gamma, so it looks like the console: checked frame by frame against a recording of the Xbox 360
-- Installs from your own disc image into the browser's storage once, then starts from there
+- Unzip, drop in your disc image, double-click: it installs into the browser's storage once, then starts from there
 - The PS5 port's hub in the browser: Home, Display, Game, Episodes, Saves, Achievements and About
 - Keyboard and mouse, or a controller, with button prompts for PlayStation, Xbox 360, Xbox One / Series and Switch pads, and readable keyboard keycaps
-- The pause menu's Controls page drawn for each controller, and for the keyboard on foot and in a vehicle
+- The pause menu's Controls page drawn for each controller, and for the keyboard on foot and in a vehicle, put into your own copy of the game's menu textures when it installs
 - Saves kept in your browser, with Download Saves, Load Saves From a File and Xbox 360 save import (each player picks their own files)
 - A loading screen with install progress, a Fullscreen button and an FPS counter (F8)
 - Play from a phone or tablet on your Wi-Fi, served from your own computer (experimental), with a device check page
@@ -32,34 +56,16 @@ The pause menu's Controls page, redrawn for each controller and the keyboard:
 
 ![PlayStation, Xbox, Switch and keyboard controls pictures](web/images/controllers.jpg)
 
-## What you need
-- An up-to-date **Chromium browser** (Chrome, Edge, Brave, Arc) with WebGPU, on a computer with about 8 GB of memory free for the page
-- Your **own** copy of GTA IV for the **USA Xbox 360** as an `.iso`, and its **Title Update 8** (the same files as the [PS5 port](README-PS5.md#which-files-work)). **No game files are included.**
-- About 8 GB free for the browser's copy of the install
-
-Safari, Firefox and iPad / iPhone browsers don't have everything the game needs yet. Open `check.html` on a device to see what's missing there.
-
-## Running it
-The page is served by a small local server, which hands the browser your disc image, Title Update 8 and the RPF key straight from disk:
-
-```bash
-python3 -I web/scripts/serve.py web/build/link "/path/to/Grand Theft Auto IV (USA).iso" /path/to/TU_1A581VI_000000K000000.0000000000205 LibertyRecompLib/aes_key.bin 8765
-```
-
-(run from the repository's folder, after a build: see below)
-
-Then open http://localhost:8765/ and the game installs itself into the browser the first time (a few minutes), and starts from there after that. `?log=1` shows the boot log, `?fps` the FPS counter.
-
-To play from another device on your Wi-Fi, start it with `GTA4_WEB_LAN=1`: it serves HTTPS on your network, and http://&lt;your computer&gt;:8766/ hands the phone or tablet the certificate to trust (once).
-
 ## Building
+To run it from a build instead of a release: `python3 web/scripts/play.py "<disc image>" "<title update>"` from the repository's folder, once `web/build/link` is built.
+
 The web build lives in [`web/`](web):
 - [`web/scripts`](web/scripts): the page (`index.html`, `scene3d.js` for the 3D renderer, `webui.js` for the hub's overlays, `gameinput.js`), the server and the build scripts. Copy them into `web/build` and run them from there.
 - [`web/shaders`](web/shaders): the tools that turn the game's shaders into WGSL.
 - [`web/thirdparty`](web/thirdparty): the third-party libraries' Emscripten build (`web/build-tp`).
 - The game-side changes are in `glue/rexglue-sdk-main` (search for `[web port]` and `__EMSCRIPTEN__`), most of them in `gta4-recomp/src/web/` and `src/graphics/web_frame_capture.cpp`.
 
-You need [Emscripten](https://emscripten.org) (`EMSDK_DIR`, by default next to this repository), then `web/scripts/rebuild.sh` compiles the game code, the runtime and the glue and links `web/build/link/gta4.wasm`. The pause menu's controller pictures are rebuilt from your own game files with `tools/xtd_tools/build_controller_diagrams.py`, so they aren't stored here. The build is a work in progress and its steps are still rough.
+You need [Emscripten](https://emscripten.org) (`EMSDK_DIR`, by default next to this repository), then `web/scripts/rebuild.sh` compiles the game code, the runtime and the glue and links `web/build/link/gta4.wasm`. The Controls pictures are drawn by `tools/xtd_tools/build_controller_diagrams.py` and stored as the pictures alone (`LibertyRecompLib/private/button_prompts/*/controller.bin`): the game puts them into the player's own `frontend_360.xtd` (`rpf_button_prompts.cpp`). `web/scripts/make-release.sh <version>` makes the release zip. The build is a work in progress and its steps are still rough.
 
 The PS5 build, its hub and its packaging are as the PS5 port has them: see [README-PS5.md](README-PS5.md) and [ps5/BUILD.md](ps5/BUILD.md).
 

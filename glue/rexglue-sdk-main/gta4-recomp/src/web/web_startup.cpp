@@ -187,10 +187,13 @@ extern "C" void rex_web_main_thread_init() {
     MountFetched((std::string("/prompts/keyboard/") + file).c_str(),
                  (std::string("/game/button_prompts/keyboard/") + file).c_str());
   }
+  // (each set's Controls picture, put into the player's own frontend_360.xtd
+  // when the archive is built, and where it goes)
   for (const char* set : {"keyboard", "ps3", "ps4", "ps5", "switch", "xbox_one", "xbox_series_x"}) {
-    MountFetched((std::string("/prompts/") + set + "/frontend_360.xtd").c_str(),
-                 (std::string("/game/button_prompts/") + set + "/frontend_360.xtd").c_str());
+    MountFetched((std::string("/prompts/") + set + "/controller.bin").c_str(),
+                 (std::string("/game/button_prompts/") + set + "/controller.bin").c_str());
   }
+  MountFetched("/prompts/controller-place.txt", "/game/button_prompts/controller-place.txt");
 
   // The PS5 hub's app folder (ps5/package/hub and ps5/assets/fonts, which the
   // test server serves at /app0): the files it looks for, each fetched when read.

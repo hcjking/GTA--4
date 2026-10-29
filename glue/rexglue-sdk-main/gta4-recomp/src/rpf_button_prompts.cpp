@@ -25,6 +25,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
+#include <rex/system/lzx.h>
 
 extern "C" {
 #include <rijndael-alg-fst.h>
@@ -574,6 +575,125 @@ bool VerifyShadow(const std::filesystem::path& path, std::span<const uint8_t> ke
   return true;
 }
 
+// The Controls picture put into the player's own frontend_360.xtd when the
+// archive is built, so no copy of the game's menu textures has to ship: the
+// resource unpacked (its XMem frames of LZX), the set's controller texture
+// (button_prompts/<set>/controller.bin: tiled DXT5, from
+// tools/xtd_tools/build_controller_diagrams.py) written over the stock one
+// (button_prompts/controller-place.txt: where, and the stock picture's SHA-256,
+// so any other version of the file is left as it is), and packed again with
+// LZX's stored blocks, which any LZX decoder reads (xtd_store.c's pack).
+constexpr uint32_t kXMemFrame = 0x8000;
+constexpr uint32_t kResourceWindow = 1u << 17;
+
+std::optional<std::vector<uint8_t>> UnpackResource(std::span<const uint8_t> resource) {
+  std::vector<uint8_t> lzx;
+  size_t total = 0;
+  for (size_t at = 20; at < resource.size();) {
+    uint32_t raw = kXMemFrame, packed = 0;
+    if (resource[at] == 0xFF) {
+      if (at + 5 > resource.size()) break;
+      raw = uint32_t(resource[at + 1]) << 8 | resource[at + 2];
+      packed = uint32_t(resource[at + 3]) << 8 | resource[at + 4];
+      at += 5;
+    } else {
+      if (at + 2 > resource.size()) break;
+      packed = uint32_t(resource[at]) << 8 | resource[at + 1];
+      at += 2;
+    }
+    if (packed == 0 || at + packed > resource.size()) break;
+    lzx.insert(lzx.end(), resource.begin() + at, resource.begin() + at + packed);
+    total += raw;
+    at += packed;
+  }
+  std::vector<uint8_t> data(total);
+  if (total == 0 ||
+      lzx_decompress(lzx.data(), lzx.size(), data.data(), data.size(), kResourceWindow, nullptr, 0) != 0) {
+    return std::nullopt;
+  }
+  return data;
+}
+
+std::vector<uint8_t> PackResource(std::span<const uint8_t> header, std::span<const uint8_t> data) {
+  std::vector<uint8_t> out(header.begin(), header.begin() + 16);
+  out.resize(20);
+  // (one stored block per frame: the first frame's E8 bit off, type 3, the
+  // 24-bit length, padding to a 16-bit word, R0-R2, the bytes, and a pad byte
+  // after an odd length)
+  for (size_t offset = 0; offset < data.size(); offset += kXMemFrame) {
+    const uint32_t raw = uint32_t(std::min<size_t>(data.size() - offset, kXMemFrame));
+    std::vector<uint8_t> frame;
+    uint32_t word = 0;
+    int used = 0;
+    auto bits = [&](uint32_t value, int count) {
+      while (count--) {
+        word = word << 1 | ((value >> count) & 1);
+        if (++used == 16) {
+          frame.push_back(uint8_t(word));
+          frame.push_back(uint8_t(word >> 8));
+          word = 0;
+          used = 0;
+        }
+      }
+    };
+    if (offset == 0) bits(0, 1);
+    bits(3, 3);
+    bits(raw, 24);
+    if (used) bits(0, 16 - used);
+    for (int r = 0; r < 3; ++r) frame.insert(frame.end(), {1, 0, 0, 0});
+    frame.insert(frame.end(), data.begin() + offset, data.begin() + offset + raw);
+    if (raw & 1) frame.push_back(0);
+    const uint32_t packed = uint32_t(frame.size());
+    if (raw == kXMemFrame) {
+      out.insert(out.end(), {uint8_t(packed >> 8), uint8_t(packed)});
+    } else {
+      out.insert(out.end(), {0xFF, uint8_t(raw >> 8), uint8_t(raw), uint8_t(packed >> 8), uint8_t(packed)});
+    }
+    out.insert(out.end(), frame.begin(), frame.end());
+  }
+  const uint32_t body = uint32_t(out.size() - 20);
+  out[16] = uint8_t(body >> 24), out[17] = uint8_t(body >> 16), out[18] = uint8_t(body >> 8), out[19] = uint8_t(body);
+  return out;
+}
+
+std::optional<std::vector<uint8_t>> BuildFrontend(const std::filesystem::path& source, std::span<const uint8_t> key,
+                                                  std::string_view variant) {
+  const auto picture_path = FindAsset(variant, "controller.bin");
+  const auto place_path = FindAsset(".", "controller-place.txt");
+  auto picture = picture_path ? ReadFile(*picture_path) : std::nullopt;
+  auto place = place_path ? ReadFile(*place_path) : std::nullopt;
+  if (!picture || picture->empty() || !place || place->empty()) {
+    return std::nullopt;
+  }
+  uint64_t offset = 0;
+  char stock_hash[65] = {};
+  const std::string place_text(place->begin(), place->end());
+  if (std::sscanf(place_text.c_str(), "%llu %64s", reinterpret_cast<unsigned long long*>(&offset), stock_hash) != 2) {
+    REXLOG_WARN("Button prompts: controller-place.txt is not '<offset> <sha256>'");
+    return std::nullopt;
+  }
+  std::string error;
+  auto archive = ParseArchive(source, key, error);
+  if (!archive || archive->frontend_entry_index == kNoEntry) {
+    REXLOG_WARN("Button prompts: no frontend_360.xtd to put the Controls picture in ({})", error);
+    return std::nullopt;
+  }
+  auto resource = ReadEntryData(source, archive->entries[archive->frontend_entry_index]);
+  auto data = resource && IsTextureDictionary(*resource) ? UnpackResource(*resource) : std::nullopt;
+  if (!data || offset + picture->size() > data->size()) {
+    REXLOG_WARN("Button prompts: the game's frontend_360.xtd could not be unpacked");
+    return std::nullopt;
+  }
+  const std::span<uint8_t> stock(data->data() + offset, picture->size());
+  if (HashBytes(stock) != stock_hash) {
+    REXLOG_WARN("Button prompts: the game's Controls picture isn't the one expected; left as it is");
+    return std::nullopt;
+  }
+  std::copy(picture->begin(), picture->end(), stock.begin());
+  REXLOG_INFO("Button prompts: '{}' Controls picture put into the game's frontend_360.xtd", variant);
+  return PackResource(*resource, *data);
+}
+
 std::optional<std::filesystem::path> PrepareArchive(const std::filesystem::path& game_data_root,
                                                     const std::filesystem::path& cache_root,
                                                     std::string_view variant) {
@@ -592,10 +712,17 @@ std::optional<std::filesystem::path> PrepareArchive(const std::filesystem::path&
   auto replacement = ReadFile(*asset_path);
   const std::string source_hash = rex::crypto::sha256_file(source);
   const std::string replacement_hash = replacement ? HashBytes(*replacement) : "";
-  // (the set's Controls picture, when it has one)
+  // (the set's Controls picture, when it has one: a ready frontend_360.xtd, or
+  // the picture alone, put into the game's own file only when the archive is
+  // built - the archive's name has the picture's hash, and the file beside it
+  // the built dictionary's, for VerifyShadow)
   const auto frontend_path = FindAsset(variant, "frontend_360.xtd");
-  const auto frontend = frontend_path ? ReadFile(*frontend_path) : std::nullopt;
-  const std::string frontend_hash = frontend ? HashBytes(*frontend) : "";
+  auto frontend = frontend_path ? ReadFile(*frontend_path) : std::nullopt;
+  if (frontend && frontend->empty()) frontend.reset();
+  std::string frontend_hash = frontend ? HashBytes(*frontend) : "";
+  const auto picture_path = frontend ? std::nullopt : FindAsset(variant, "controller.bin");
+  const auto picture = picture_path ? ReadFile(*picture_path) : std::nullopt;
+  const std::string picture_hash = picture && !picture->empty() ? HashBytes(*picture) : "";
   if (!replacement || source_hash.empty() || replacement_hash.empty()) {
     REXLOG_WARN("Button prompts: could not read or hash the archive inputs");
     return std::nullopt;
@@ -609,15 +736,29 @@ std::optional<std::filesystem::path> PrepareArchive(const std::filesystem::path&
                 fs_error.message());
     return std::nullopt;
   }
-  const std::string cache_name = "xbox360-" + source_hash.substr(0, 16) + "-" + replacement_hash.substr(0, 16) +
-                                 (frontend_hash.empty() ? "" : "-" + frontend_hash.substr(0, 16)) + ".rpf";
+  const std::string frontend_tag = !frontend_hash.empty() ? "-" + frontend_hash.substr(0, 16)
+                                   : !picture_hash.empty() ? "-p" + picture_hash.substr(0, 15)
+                                                           : "";
+  const std::string cache_name =
+      "xbox360-" + source_hash.substr(0, 16) + "-" + replacement_hash.substr(0, 16) + frontend_tag + ".rpf";
   const auto destination = prompt_cache / cache_name;
+  const auto built_hash_path = destination.string() + ".frontend";
 
   std::string error;
-  if (std::filesystem::is_regular_file(destination, fs_error) &&
-      VerifyShadow(destination, *key, replacement_hash, frontend_hash, error)) {
-    REXLOG_INFO("Button prompts: using cached '{}' archive", variant);
-    return destination;
+  if (std::filesystem::is_regular_file(destination, fs_error)) {
+    std::string cached_frontend_hash = frontend_hash;
+    if (!picture_hash.empty()) {
+      const auto built = ReadFile(built_hash_path);
+      cached_frontend_hash = built ? std::string(built->begin(), built->end()) : "";
+    }
+    if (VerifyShadow(destination, *key, replacement_hash, cached_frontend_hash, error)) {
+      REXLOG_INFO("Button prompts: using cached '{}' archive", variant);
+      return destination;
+    }
+  }
+  if (!picture_hash.empty()) {
+    frontend = BuildFrontend(source, *key, variant);
+    frontend_hash = frontend ? HashBytes(*frontend) : "";
   }
 
   const auto temporary = destination.string() + ".tmp";
@@ -642,13 +783,17 @@ std::optional<std::filesystem::path> PrepareArchive(const std::filesystem::path&
     REXLOG_WARN("Button prompts: could not publish shadow archive: {}", rename_error);
     return std::nullopt;
   }
+  if (!picture_hash.empty()) {
+    std::ofstream(built_hash_path, std::ios::binary | std::ios::trunc) << frontend_hash;
+  }
   REXLOG_INFO("Button prompts: built '{}' shadow archive at '{}'", variant, destination.string());
   // (the archives built for other sets or earlier assets: a 60 MB copy of
   // xbox360.rpf each, which would pile up - in the browser, in its storage)
   for (auto it = std::filesystem::directory_iterator(prompt_cache, fs_error);
        !fs_error && it != std::filesystem::directory_iterator(); it.increment(fs_error)) {
     const std::string name = it->path().filename().string();
-    if (it->path() != destination && name.starts_with("xbox360-") && name.ends_with(".rpf")) {
+    if (it->path() != destination && it->path().string() != built_hash_path && name.starts_with("xbox360-") &&
+        (name.ends_with(".rpf") || name.ends_with(".rpf.frontend"))) {
       std::error_code remove_error;
       std::filesystem::remove(it->path(), remove_error);
     }

@@ -18,7 +18,11 @@
 *.xcp
 .DS_Store
 
-# [web port] the pause menu Controls pictures, rebuilt from the game's own
-# frontend_360.xtd (tools/xtd_tools/build_controller_diagrams.py): kept local
+# [web port] the pause menu Controls pictures: frontend_360.xtd, a copy of the
+# game's own menu textures, stays local; the pictures alone (our drawings:
+# controller.bin, the keyboard's controls_*.bin, and controller-place.txt) are
+# tracked, and put into the player's own file (rpf_button_prompts.cpp).
 button_prompts/*/frontend_360.xtd
-button_prompts/*/controls_*.bin
+!button_prompts/controller-place.txt
+!button_prompts/**/controller.bin
+!button_prompts/keyboard/controls_*.bin
