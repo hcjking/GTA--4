@@ -220,7 +220,9 @@ bool WindowSDL::OpenImpl() {
     }
   }
 
-  if (IsFullscreen() && !REX_PLATFORM_PS5) {
+  if (IsFullscreen() && !REX_PLATFORM_PS5 && !REX_PLATFORM_WEB) {
+    // ([web port] the page's Fullscreen button does it: SDL would fullscreen the
+    // bare canvas on the next click or key, which shows black)
     // Borderless desktop fullscreen (a NULL display mode is SDL3's default).
     if (!SDL_SetWindowFullscreen(sdl_window_, true)) {
       REXLOG_ERROR("SDL_SetWindowFullscreen failed: {}", SDL_GetError());
@@ -243,7 +245,7 @@ bool WindowSDL::OpenImpl() {
   // Fullscreen transitions may be asynchronous. Synchronize when possible so
   // the first surface observes final geometry, but a timeout only means the
   // transition is still pending. SDL window events will update the surface.
-  if (IsFullscreen() && !REX_PLATFORM_PS5 && !SDL_SyncWindow(sdl_window_)) {
+  if (IsFullscreen() && !REX_PLATFORM_PS5 && !REX_PLATFORM_WEB && !SDL_SyncWindow(sdl_window_)) {
     REXLOG_WARN("SDL_SyncWindow timed out while entering fullscreen; continuing asynchronously");
   }
 
@@ -390,6 +392,9 @@ uint32_t WindowSDL::GetLatestDpiImpl() const {
 void WindowSDL::ApplyNewFullscreen() {
 #if REX_PLATFORM_PS5
   return;  // [ps5 port] the window stays the TV picture's size
+#endif
+#if REX_PLATFORM_WEB
+  return;  // [web port] the page's Fullscreen button owns fullscreen
 #endif
   if (!sdl_window_) {
     return;
