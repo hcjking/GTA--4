@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GTA IV Device Check</title>
+<!-- What the web build needs from this browser, tested here: the secure,
+     cross-origin isolated page (shared memory), 64-bit WebAssembly memory as
+     the build makes it (shared, up to 16 GiB) and how far it grows, WebGPU and
+     the features scene3d.js asks for, and the site storage the install fills. -->
+<style>
+  :root { --bg: #111; --text: #ddd; --dim: #888; --ok: #6c6; --bad: #e66; --warn: #eb5; }
+  @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) { --bg: #f6f6f6; --text: #222; --dim: #666; --ok: #282; --bad: #b22; --warn: #a70; } }
+  :root[data-theme="dark"] { --bg: #111; --text: #ddd; --dim: #888; --ok: #6c6; --bad: #e66; --warn: #eb5; }
+  body { font: 16px -apple-system, system-ui, sans-serif; background: var(--bg); color: var(--text); max-width: 720px; margin: 20px auto; padding: 0 16px; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 6px 4px; border-bottom: 1px solid #8884; vertical-align: top; word-break: break-word; }
+  td:first-child { width: 42%; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); } .dim { color: var(--dim); }
+  button { font: inherit; padding: 8px 14px; margin-top: 14px; }
+  pre { white-space: pre-wrap; font-size: 13px; color: var(--dim); }
+</style>
+</head>
+<body>
+<h2>Can this device run GTA IV?</h2>
+<p id="summary" class="dim">Checking...</p>
+<table id="rows"></table>
+<button id="copy">Copy results</button>
+<pre id="ua"></pre>
+<script>
+const rows = document.getElementById('rows'), results = [];
+const add = (name, state, detail) => {
+  results.push(`${state === 'ok' ? 'OK  ' : state === 'bad' ? 'FAIL' : 'WARN'} ${name}: ${detail}`);
+  const tr = rows.insertRow();
+  tr.insertCell().textContent = name;
+  const td = tr.insertCell();
+  td.className = state;
+  td.textContent = (state === 'ok' ? '✓ ' : state === 'bad' ? '✗ ' : '! ') + detail;
+};
+const gib = b => (b / 2 ** 30).toFixed(1) + ' GiB';
+document.getElementById('ua').textContent = navigator.userAgent;
+
+(async () => {
+  let fatal = 0;
+  const need = (name, ok, good, badText) => { add(name, ok ? 'ok' : 'bad', ok ? good : badText); if (!ok) fatal++; };
+
+  need('Secure page (HTTPS)', isSecureContext, 'yes', 'no: open it with https:// and a trusted certificate');
+  need('Cross-origin isolated', self.crossOriginIsolated === true, 'yes', 'no: shared memory is off');
+  need('SharedArrayBuffer', typeof SharedArrayBuffer === 'function', 'yes', 'missing');
+
+  // Modules with one memory each, apart so a missing piece shows by itself:
+  // 64-bit (flags 0x04), shared 32-bit (0x03: maximum, shared), and both (0x07).
+  const valid = flags => {
+    const module = new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 5, 4, 1, flags, 1, 1]);
+    try { return WebAssembly.validate(module); } catch (e) { return false; }
+  };
+  need('WebAssembly memory64', valid(0x05), 'supported', 'not supported by this browser');
+  need('WebAssembly shared memory', valid(0x03), 'supported', 'not supported (needs the isolated page above)');
+  const validated = valid(0x07);
+  need('Shared memory64 (what the game uses)', validated, 'supported', 'not supported');
+
+  // The memory as the build makes it: 256 MiB to start, at most 16 GiB.
+  let memory = null;
+  if (validated) {
+    try {
+      memory = new WebAssembly.Memory({ initial: 4096n, maximum: 262144n, shared: true, address: 'i64' });
+    } catch (e) {
+      try { memory = new WebAssembly.Memory({ initial: 4096n, maximum: 262144n, shared: true, index: 'i64' }); }
+      catch (e2) { need('16 GiB memory reservation', false, '', e2.message || String(e2)); }
+    }
+  }
+  if (memory) {
+    add('16 GiB memory reservation', 'ok', 'made');
+    // How far it grows, 512 MiB at a time, up to 8 GiB.
+    let size = 4096, grown = 4096;
+    for (const target of [8192, 16384, 32768, 49152, 65536, 81920, 98304, 131072]) {
+      try { memory.grow(BigInt(target - size)); size = grown = target; } catch (e) { break; }
+    }
+    const bytes = grown * 65536;
+    add('Memory it could grow to', bytes >= 6 * 2 ** 30 ? 'ok' : bytes >= 4 * 2 ** 30 ? 'warn' : 'bad',
+        gib(bytes) + (bytes < 4 * 2 ** 30 ? ' (likely too little)' : bytes < 6 * 2 ** 30 ? ' (may be tight)' : ''));
+    memory = null;
+  }
+
+  if (!navigator.gpu) {
+    need('WebGPU', false, '', 'not available (Safari: Settings → Apps → Safari → Advanced → Feature Flags)');
+  } else {
+    let adapter = null;
+    try { adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }); } catch (e) {}
+    need('WebGPU', !!adapter, 'available', 'no GPU adapter');
+    if (adapter) {
+      const info = adapter.info || {};
+      add('GPU', 'ok', [info.vendor, info.architecture, info.description].filter(Boolean).join(' ') || 'unknown');
+      const has = f => adapter.features.has(f);
+      add('BC compressed textures', has('texture-compression-bc') ? 'ok' : 'warn',
+          has('texture-compression-bc') ? 'yes' : 'no: textures are decompressed instead (more memory, slower loads)');
+      for (const f of ['depth32float-stencil8', 'depth-clip-control', 'clip-distances', 'float32-filterable', 'float32-blendable'])
+        add(f, has(f) ? 'ok' : 'warn', has(f) ? 'yes' : 'no');
+      add('Largest GPU buffer', adapter.limits.maxBufferSize >= 2 ** 30 ? 'ok' : 'warn', gib(adapter.limits.maxBufferSize));
+      try { (await adapter.requestDevice()).destroy(); add('GPU device', 'ok', 'created'); }
+      catch (e) { need('GPU device', false, '', e.message || String(e)); }
+    }
+  }
+
+  // The install puts about 6.7 GB in the site's storage.
+  if (!navigator.storage || !navigator.storage.getDirectory) {
+    need('Site storage (OPFS)', false, '', 'not available');
+  } else {
+    try { await navigator.storage.getDirectory(); add('Site storage (OPFS)', 'ok', 'available'); }
+    catch (e) { need('Site storage (OPFS)', false, '', e.message || String(e)); }
+    try {
+      const { quota = 0, usage = 0 } = await navigator.storage.estimate();
+      const free = quota - usage;
+      add('Storage it may use', free >= 8e9 ? 'ok' : 'bad', gib(free) + (free < 8e9 ? ' (the install needs about 6.7 GB)' : ''));
+      if (free < 8e9) fatal++;
+    } catch (e) { add('Storage it may use', 'warn', 'unknown'); }
+    try { add('Storage kept (persist)', (await navigator.storage.persist()) ? 'ok' : 'warn', (await navigator.storage.persisted()) ? 'yes' : 'not granted: the browser may clear it'); }
+    catch (e) {}
+  }
+  if (navigator.deviceMemory) add('Device memory (reported)', 'ok', navigator.deviceMemory + ' GB or more');
+  add('CPU threads', navigator.hardwareConcurrency >= 4 ? 'ok' : 'warn', String(navigator.hardwareConcurrency || '?'));
+
+  const summary = document.getElementById('summary');
+  summary.className = fatal ? 'bad' : 'ok';
+  summary.textContent = fatal ? `${fatal} thing${fatal > 1 ? 's' : ''} missing: the game won't run here yet.`
+                              : 'Everything the game needs is here. Warnings may cost speed or memory.';
+  results.unshift(summary.textContent);
+})();
+
+document.getElementById('copy').onclick = async () => {
+  const text = results.join('\n') + '\n' + navigator.userAgent;
+  try { await navigator.clipboard.writeText(text); document.getElementById('copy').textContent = 'Copied'; }
+  catch (e) { prompt('Copy these results:', text); }
+};
+</script>
+</body>
+</html>

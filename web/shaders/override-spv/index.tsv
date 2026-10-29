@@ -1,0 +1,9 @@
+F6AEB9A606561C54.spv	postfx/composite_f6aeb9a606561c54.hlsl
+EE75C9F6AA1AB16A.spv	motion_blur/gta_composite_mb.hlsl
+E51D9DD95A333D92.spv	motion_blur/gta_composite_mb_high_dof.hlsl
+D3B2B2125BC24911.spv	motion_blur/gta_composite_mb_dof_debug.hlsl
+94CC5AF0E2FF5B08.spv	motion_blur/gta_composite_mb_high_dof_debug.hlsl
+156BAD4A9EE62726.spv	bink/vs_bink.hlsl
+9E76B68B60127349.spv	bink/ps_bink.hlsl
+A6C9E2B8B2A59D7A.spv	bink/ps_bink_no_alpha.hlsl
+535ACDAB8AE84D82.spv	motion_blur/gta_composite_mb_e2.glsl

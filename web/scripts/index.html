@@ -1,0 +1,696 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GTA IV</title>
+<style>
+  :root { --bg: #000; --fg: #ddd; --dim: #888; --err: #ff8a80; --accent: #f0b030; --panel: rgba(12, 12, 12, 0.92); }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--fg); overflow: hidden;
+         font: 15px/1.4 -apple-system, system-ui, "Segoe UI", sans-serif; }
+  /* The game, as large as the window allows at 16:9, centred. */
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #frame { position: relative; width: min(100vw, calc(100vh * 16 / 9)); aspect-ratio: 16 / 9; }
+  #scene, #canvas { position: absolute; inset: 0; display: block; margin: 0; max-width: none;
+                    width: 100% !important; height: 100% !important; background: #000; }
+  #scene:focus { outline: none; }
+  /* The game's own canvas (SDL's input: mouse, pointer lock), transparent over
+     the picture so the mouse reaches the game. */
+  #canvas { background: transparent; opacity: 0; cursor: crosshair; }
+  canvas[hidden] { display: none; }
+  #fps { position: absolute; left: 8px; top: 8px; padding: 3px 7px; border-radius: 4px; pointer-events: none;
+         font: 600 12px/1.3 ui-monospace, Menlo, monospace; color: #9f9; background: rgba(0, 0, 0, 0.6); }
+  #fps[hidden] { display: none; }
+
+  /* Loading: what's happening, how far along, and a note when it goes quiet. */
+  #loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+             background: radial-gradient(ellipse at center, #1c1c1c 0%, #000 75%); pointer-events: none; }
+  #loading[hidden] { display: none; }
+  #loading .box { width: min(440px, 80%); text-align: left; }
+  #loading .title { font: 800 clamp(28px, 5vw, 46px)/1 -apple-system, system-ui, sans-serif; letter-spacing: 0.02em; color: #fff; }
+  #phase { margin-top: 18px; font-weight: 600; color: var(--fg); }
+  .track { position: relative; height: 6px; margin-top: 10px; border-radius: 3px; background: #2a2a2a; overflow: hidden; }
+  #fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; border-radius: 3px; background: var(--accent);
+          transition: width 0.4s ease; }
+  .track.busy #fill { width: 30% !important; animation: busy 1.3s ease-in-out infinite; }
+  @keyframes busy { from { left: -30%; } to { left: 100%; } }
+  #detail { margin-top: 8px; min-height: 1.4em; font-size: 13px; color: var(--dim); font-variant-numeric: tabular-nums; }
+  #stall { margin-top: 10px; font-size: 13px; color: var(--accent); }
+  #loading.failed #phase { color: var(--err); }
+  #loading.failed .track { display: none; }
+  #loading button { pointer-events: auto; }
+
+  /* The buttons: top right, shown while the mouse moves (and always while loading). */
+  #bar { position: fixed; top: 10px; right: 10px; display: flex; gap: 6px; z-index: 3; transition: opacity 0.3s; }
+  #bar.idle { opacity: 0; pointer-events: none; }
+  button { font: 600 13px/1 -apple-system, system-ui, sans-serif; color: #eee; background: rgba(30, 30, 30, 0.85);
+           border: 1px solid #555; border-radius: 6px; padding: 8px 11px; cursor: pointer; }
+  button:hover { background: rgba(60, 60, 60, 0.9); }
+
+  /* The log (Log button, or ?log=1): the boot messages, for when something breaks. */
+  #debug { position: fixed; left: 0; right: 0; bottom: 0; height: 42vh; z-index: 2; overflow: auto;
+           background: var(--panel); border-top: 1px solid #333; font: 12px/1.4 ui-monospace, Menlo, monospace; }
+  #debug[hidden] { display: none; }
+  #status { display: block; padding: 6px 16px 0; color: var(--dim); }
+  #thumbs { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 16px; }
+  #thumbs figure { margin: 0; color: var(--dim); }
+  #thumbs canvas { width: 160px; height: auto; margin: 0; background: #333; }
+  #log { margin: 0; padding: 8px 16px; white-space: pre-wrap; word-break: break-all; }
+  .err { color: var(--err); }
+</style>
+</head>
+<body>
+<!-- The old 2D-only compositor (?show2d=1 shows it); the game is #scene. -->
+<canvas id="screen" width="1280" height="720" hidden></canvas>
+<div id="stage">
+<div id="frame">
+<canvas id="scene" width="1280" height="720" tabindex="0"></canvas>
+<canvas id="canvas" tabindex="-1"></canvas>
+<div id="fps" hidden></div>
+<div id="loading">
+  <div class="box">
+    <div class="title">GTA IV</div>
+    <div id="phase">Starting…</div>
+    <div class="track busy"><div id="fill"></div></div>
+    <div id="detail"></div>
+    <div id="stall" hidden></div>
+  </div>
+</div>
+</div>
+</div>
+<!-- (outside #stage: clicking these doesn't lock the mouse or reach the game) -->
+<div id="bar">
+  <button id="log-button" type="button">Log</button>
+  <button id="fullscreen-button" type="button">Fullscreen</button>
+</div>
+<div id="debug" hidden>
+  <span id="status">loading…</span>
+  <div id="thumbs"></div>
+  <pre id="log"></pre>
+</div>
+<script>
+  // The loading screen, from the boot messages: starting, installing from the
+  // disc (with its progress), loading, and the game starting after the hub's
+  // Start. It goes when the hub's first frame is shown, and when the game's is.
+  const Loading = (() => {
+    const box = document.getElementById('loading'), phase = document.getElementById('phase');
+    const track = box.querySelector('.track'), fill = document.getElementById('fill');
+    const detail = document.getElementById('detail'), stall = document.getElementById('stall');
+    let lastNews = performance.now(), waitingForGame = -1;
+    const show = (text, percent, more = '') => {
+      box.hidden = false;
+      box.classList.remove('failed');
+      phase.textContent = text;
+      track.classList.toggle('busy', percent == null);
+      if (percent != null) fill.style.width = Math.max(0, Math.min(100, percent)) + '%';
+      detail.textContent = more;
+      lastNews = performance.now();
+    };
+    const hide = () => { box.hidden = true; waitingForGame = -1; };
+    const fail = message => {
+      show("GTA IV couldn't start", null, message);
+      box.classList.add('failed');
+      document.getElementById('debug').hidden = false;
+    };
+    const gb = mib => (mib / 1024).toFixed(1);
+    setInterval(() => {
+      if (box.hidden || box.classList.contains('failed')) return void (stall.hidden = true);
+      // (the game's first frame after Start: the loading screen's done)
+      if (waitingForGame >= 0 && Module._rex_web_present_count && Module._rex_web_present_count() > waitingForGame) hide();
+      const quiet = (performance.now() - lastNews) / 1000;
+      stall.hidden = quiet < 30;
+      stall.textContent = `No news for ${Math.round(quiet)} s. The first launch can take several minutes: keep this tab open.`;
+    }, 1000);
+    return {
+      note(text, isErr) {
+        let m;
+        if (/^ABORT: |this browser has no WebGPU|install FAILED/.test(text)) return fail(text.replace(/^ABORT: /, ''));
+        if (box.hidden && !/START GAME/.test(text)) return;
+        if (text.startsWith('runtime initialized')) show('Loading…', null);
+        else if (/is not installed/.test(text)) show('Installing GTA IV from your disc', 0, 'This happens once per browser.');
+        else if ((m = text.match(/install: (\d+) \/ (\d+) MiB \((\d+)%\), ([\d.]+) MiB\/s/))) {
+          const [copied, total, percent, speed] = [+m[1], +m[2], +m[3], +m[4]];
+          const left = speed > 0 ? Math.max(0, (total - copied) / speed) : 0;
+          show('Installing GTA IV from your disc', percent,
+               `${gb(copied)} of ${gb(total)} GB · ${Math.round(speed)} MB/s` +
+               (left >= 1 ? ` · about ${left < 60 ? Math.ceil(left) + ' s' : Math.ceil(left / 60) + ' min'} left` : ''));
+        } else if (/install finished/.test(text)) show('Loading…', null, 'Installed.');
+        // (the first frame comes while the hub's still loading its pictures:
+        // the loading screen stays until the hub says it's ready, 10 s at most)
+        else if (/web screen: first frame shown/.test(text)) {
+          show('Loading the menu…', null);
+          setTimeout(() => { if (waitingForGame < 0) hide(); }, 10000);
+        } else if (/PS5 hub: installed |PS5 hub: .* Menu: playing/.test(text) && waitingForGame < 0) hide();
+        else if (/START GAME/.test(text)) {
+          show('Starting GTA IV…', null);
+          waitingForGame = Module._rex_web_present_count ? Module._rex_web_present_count() : 0;
+        } else lastNews = performance.now();
+      },
+    };
+  })();
+
+  // (the game names the window after itself: the tab stays "GTA IV")
+  new MutationObserver(() => { if (document.title !== 'GTA IV') document.title = 'GTA IV'; })
+    .observe(document.querySelector('title'), { childList: true, characterData: true, subtree: true });
+
+  // The buttons: the log, and fullscreen. Shown while the mouse moves.
+  (() => {
+    const bar = document.getElementById('bar'), debug = document.getElementById('debug');
+    const logButton = document.getElementById('log-button'), fullButton = document.getElementById('fullscreen-button');
+    debug.hidden = !new URLSearchParams(location.search).has('log');
+    logButton.onclick = () => { debug.hidden = !debug.hidden; };
+    const root = document.documentElement;
+    if (!root.requestFullscreen && !root.webkitRequestFullscreen) fullButton.hidden = true;
+    fullButton.onclick = () => {
+      if (document.fullscreenElement || document.webkitFullscreenElement)
+        (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      else (root.requestFullscreen || root.webkitRequestFullscreen).call(root);
+    };
+    const label = () => {
+      fullButton.textContent = document.fullscreenElement || document.webkitFullscreenElement ? 'Exit Fullscreen' : 'Fullscreen';
+    };
+    document.addEventListener('fullscreenchange', label);
+    document.addEventListener('webkitfullscreenchange', label);
+    // (the mouse locked to the game isn't the mouse moving over the page)
+    let idle;
+    const wake = () => {
+      bar.classList.remove('idle');
+      clearTimeout(idle);
+      idle = setTimeout(() => {
+        if (document.getElementById('loading').hidden && debug.hidden) bar.classList.add('idle');
+      }, 2500);
+    };
+    addEventListener('mousemove', () => { if (!document.pointerLockElement) wake(); });
+    addEventListener('touchstart', wake, { passive: true });
+    wake();
+  })();
+
+  // Every line is also kept on window for the test harness to read back.
+  window.bootLog = [];
+  const logEl = document.getElementById('log');
+  const statusEl = document.getElementById('status');
+  function line(text, isErr) {
+    const stamp = (performance.now() / 1000).toFixed(2).padStart(7);
+    const entry = `[${stamp}s] ${text}`;
+    window.bootLog.push(entry);
+    Loading.note(String(text), isErr);
+    if (window.bootLog.length < 4000) {
+      const span = document.createElement('span');
+      if (isErr) span.className = 'err';
+      span.textContent = entry + '\n';
+      logEl.appendChild(span);
+    }
+    (isErr ? console.error : console.log)(entry);
+  }
+  window.addEventListener('error', e => line('window error: ' + e.message, true));
+  window.addEventListener('unhandledrejection', e => line('unhandled rejection: ' + (e.reason && e.reason.stack || e.reason), true));
+
+  var Module = {
+    // SDL installs these pointer helpers only when they are missing. Its
+    // 64-bit version expects BigInt pointers, but Emscripten passes the audio
+    // callback's buffer as a Number, so accept either.
+    SDL3: {
+      CPtrToHeap32Index: ptr => Math.floor(Number(ptr) / 4),
+      JSVarToCPtr: v => BigInt(v),
+    },
+    canvas: document.getElementById('canvas'),
+    // The runtime's log is off unless diagnostics are requested.
+    // Keyboard and mouse: GTA IV PC's controls (the game's native input;
+    // ?arg=--mnk_controller_emulation=true maps them onto controller 1 instead).
+    // (the console's shadow distance and reflection size, as the PS5 build and
+    // the Xbox 360 have them, rather than the desktop defaults 2.0 / 1080p;
+    // ?arg= values after them win)
+    arguments: ['--diagnostics=true', '--diagnostics_categories=logging',
+                '--gta4_shadow_distance_scale=1.0', '--gta4_reflection_resolution=original',
+                ...new URLSearchParams(location.search).getAll('arg')],
+    print: t => line(t, false),
+    printErr: t => line(t, true),
+    setStatus: t => { if (t) statusEl.textContent = t; },
+    // The disc is mounted by web_iso_mount.cpp (WasmFS fetch backend).
+    // ?env=NAME=VALUE sets environment variables for the game (tracing switches).
+    preRun: [() => {
+      for (const pair of new URLSearchParams(location.search).getAll('env')) {
+        const at = pair.indexOf('=');
+        if (at > 0) ENV[pair.slice(0, at)] = pair.slice(at + 1);
+      }
+      line('HOME=' + ENV.HOME);
+    }],
+    onRuntimeInitialized: () => {
+      line('runtime initialized; main() starting on a worker');
+      startScreen().catch(e => line('web screen: ' + (e && e.stack || e), true));
+    },
+    onAbort: what => { statusEl.textContent = 'aborted'; line('ABORT: ' + what, true); },
+  };
+  line('crossOriginIsolated=' + self.crossOriginIsolated);
+
+  // Records `seconds` of the game's audio output as 16-bit stereo WAV and
+  // uploads it to the local test server (uploads/<name>). Taps SDL's audio
+  // node with a script processor that passes nothing on.
+  window.recordGameAudio = async function (seconds, name) {
+    const sdl = Module.SDL3, context = sdl.audioContext, source = sdl.audio_playback.scriptProcessorNode;
+    const tap = context.createScriptProcessor(4096, 2, 2);
+    const chunks = [[], []];
+    let frames = 0;
+    const total = Math.round(seconds * context.sampleRate);
+    await new Promise(resolve => {
+      tap.onaudioprocess = event => {
+        for (let c = 0; c < 2; c++) chunks[c].push(new Float32Array(event.inputBuffer.getChannelData(c)));
+        for (let c = 0; c < 2; c++) event.outputBuffer.getChannelData(c).fill(0);
+        frames += event.inputBuffer.length;
+        if (frames >= total) resolve();
+      };
+      source.connect(tap);
+      tap.connect(context.destination);
+    });
+    source.disconnect(tap);
+    tap.disconnect();
+    const rate = context.sampleRate, wav = new DataView(new ArrayBuffer(44 + frames * 4));
+    const text = (o, s) => [...s].forEach((ch, i) => wav.setUint8(o + i, ch.charCodeAt(0)));
+    text(0, 'RIFF'); wav.setUint32(4, 36 + frames * 4, true); text(8, 'WAVEfmt ');
+    wav.setUint32(16, 16, true); wav.setUint16(20, 1, true); wav.setUint16(22, 2, true);
+    wav.setUint32(24, rate, true); wav.setUint32(28, rate * 4, true); wav.setUint16(32, 4, true);
+    wav.setUint16(34, 16, true); text(36, 'data'); wav.setUint32(40, frames * 4, true);
+    let offset = 44;
+    for (let k = 0; k < chunks[0].length; k++) {
+      for (let i = 0; i < chunks[0][k].length; i++) {
+        for (let c = 0; c < 2; c++) {
+          const v = Math.max(-1, Math.min(1, chunks[c][k][i]));
+          if (offset < wav.byteLength) wav.setInt16(offset, v * 32767, true);
+          offset += 2;
+        }
+      }
+    }
+    await fetch('/upload/' + name, { method: 'POST', body: wav.buffer });
+    return name + ': ' + (frames / rate).toFixed(1) + ' s at ' + rate + ' Hz';
+  };
+
+  // The game's 2D frame (web_frame_capture.h): its immediate-mode quads in
+  // draw order, each texture multiplied by its colour, alpha blended over the
+  // latest clear colour, in the guest's 1280x720 screen space. WebGPU objects
+  // belong to one thread, so this runs on the page's main thread and reads
+  // the frame from shared memory every animation frame.
+  async function startScreen() {
+    if (!navigator.gpu) { line('web screen: this browser has no WebGPU', true); return; }
+    const adapter = await navigator.gpu.requestAdapter();
+    const device = await adapter.requestDevice(Scene3D.deviceDescriptor(adapter));
+    Scene3D.init(device);
+    WebUi.init(device, navigator.gpu.getPreferredCanvasFormat());
+    const screen = document.getElementById('screen');
+    const context = screen.getContext('webgpu');
+    const format = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({ device, format, alphaMode: 'opaque',
+                        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST });
+    // Frames are drawn here, then copied to the canvas; captures read it back.
+    const frameTexture = device.createTexture({ size: [1280, 720], format,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING });
+    let captures = 0, capturing = false, lastSignature = '', lastCaptureTime = 0;
+    const module = device.createShaderModule({ code: `
+      @group(0) @binding(0) var image: texture_2d<f32>;
+      @group(0) @binding(1) var image_sampler: sampler;
+      struct In { @location(0) pos: vec2f, @location(1) uv: vec2f, @location(2) color: vec4f };
+      struct Out { @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) color: vec4f };
+      @vertex fn vs(v: In) -> Out {
+        var out: Out;
+        out.pos = vec4f(v.pos, 0.0, 1.0);
+        out.uv = v.uv;
+        out.color = v.color;
+        return out;
+      }
+      @fragment fn fs(in: Out) -> @location(0) vec4f {
+        return textureSample(image, image_sampler, in.uv) * in.color;
+      }` });
+    const blend = { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+                    alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } };
+    const bindLayout = device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} }] });
+    const layout = device.createPipelineLayout({ bindGroupLayouts: [bindLayout] });
+    // One pipeline per output state the game uses: its colour write mask
+    // (Xenos and WebGPU share the RGBA bit order) and RB_BLENDCONTROL.
+    const factors = { 0: 'zero', 1: 'one', 4: 'src', 5: 'one-minus-src', 6: 'src-alpha',
+      7: 'one-minus-src-alpha', 8: 'dst', 9: 'one-minus-dst', 10: 'dst-alpha', 11: 'one-minus-dst-alpha',
+      12: 'constant', 13: 'one-minus-constant', 14: 'constant', 15: 'one-minus-constant',
+      16: 'src-alpha-saturated' };
+    const operations = { 0: 'add', 1: 'subtract', 2: 'min', 3: 'max', 4: 'reverse-subtract' };
+    const component = (src, op, dst) => {
+      const operation = operations[op] || 'add';
+      return operation === 'min' || operation === 'max'
+        ? { operation, srcFactor: 'one', dstFactor: 'one' }
+        : { operation, srcFactor: factors[src] || 'one', dstFactor: factors[dst] || 'zero' };
+    };
+    const pipelines = {};
+    function pipelineFor(output, blendControl) {
+      const key = output + ':' + blendControl;
+      if (pipelines[key]) return pipelines[key];
+      const target = { format, writeMask: output & 0xF };
+      if (output & 0x80000000) {
+        target.blend = {
+          color: component(blendControl & 0x1F, (blendControl >>> 5) & 7, (blendControl >>> 8) & 0x1F),
+          alpha: component((blendControl >>> 16) & 0x1F, (blendControl >>> 21) & 7, (blendControl >>> 24) & 0x1F) };
+      }
+      return pipelines[key] = device.createRenderPipeline({
+        layout,
+        vertex: { module, entryPoint: 'vs', buffers: [{ arrayStride: 32, attributes: [
+          { shaderLocation: 0, offset: 0, format: 'float32x2' },
+          { shaderLocation: 1, offset: 8, format: 'float32x2' },
+          { shaderLocation: 2, offset: 16, format: 'float32x4' }] }] },
+        fragment: { module, entryPoint: 'fs', targets: [target] },
+        primitive: { topology: 'triangle-list' },
+      });
+    }
+    const pipeline = pipelineFor(0xF, 0);  // plain copy: the screen composite
+    const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear',
+      addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
+    const bindFor = texture => device.createBindGroup({ layout: bindLayout,
+      entries: [{ binding: 0, resource: texture.createView() }, { binding: 1, resource: sampler }] });
+    const white = device.createTexture({ size: [1, 1], format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    device.queue.writeTexture({ texture: white }, new Uint8Array([255, 255, 255, 255]), { bytesPerRow: 4 }, [1, 1]);
+    const whiteBind = bindFor(white);
+    const slots = [];  // texture table slot -> { serial, texture, width, height, format, bind, view }
+    // Xenos formats the capture sends as BC blocks, when the device takes them.
+    const compressedFormats = { 18: { format: 'bc1-rgba-unorm', bytes: 8 }, 19: { format: 'bc2-rgba-unorm', bytes: 16 },
+                                20: { format: 'bc3-rgba-unorm', bytes: 16 }, 49: { format: 'bc5-rg-unorm', bytes: 16 } };
+    if (device.features.has('texture-compression-bc') && !location.search.includes('nobc')) {
+      Module._rex_web_set_option(4, 1);
+      line('web screen: compressed (BC) textures on');
+    }
+    let retiredTextures = [];
+    let sequence = -1, frames = 0, thumbs = 0;
+    const targetTextures = {};  // base address -> { serial, texture, width, height, bind }
+    line('web screen: WebGPU ready (' + format + ')');
+
+    // Float32 values to float16 bits (round to nearest, overflow to infinity).
+    function toHalf(floats) {
+      const out = new Uint16Array(floats.length), bits = new Uint32Array(floats.buffer, floats.byteOffset, floats.length);
+      for (let i = 0; i < floats.length; i++) {
+        const b = bits[i], sign = (b >>> 16) & 0x8000, e = ((b >>> 23) & 0xFF) - 127 + 15, m = b & 0x7FFFFF;
+        if (((b >>> 23) & 0xFF) === 0xFF) out[i] = sign | 0x7C00 | (m ? 0x200 : 0);
+        else if (e >= 31) out[i] = sign | 0x7C00;
+        else if (e <= 0) out[i] = e < -10 ? sign : sign | ((m | 0x800000) >> (14 - e));
+        else out[i] = sign | (e << 10) | ((m + 0x1000) >> 13);
+      }
+      return new Uint8Array(out.buffer);
+    }
+
+    function syncTexture(memory, table, index) {
+      const at = table + index * 24;
+      const serial = memory.getUint32(at + 16, true);
+      if (slots[index] && slots[index].serial === serial) return slots[index].bind;
+      const width = memory.getUint32(at, true), height = memory.getUint32(at + 4, true);
+      const pixels = Number(memory.getBigUint64(at + 8, true));
+      if (!width || !height || !pixels) return whiteBind;
+      // BC blocks (web_frame_capture.cpp kCompressedFlag), RGBA16F (0x200) or
+      // RGBA32F (0x400) texels for float formats, or RGBA8; 0x800 a cube
+      // map, its six faces one after another (each with its mips).
+      const kind = memory.getUint32(at + 20, true);
+      const bc = kind & 0x100 ? compressedFormats[kind & 0xFF] : null;
+      // (32-bit float texels as 16-bit floats when the device can't filter
+      // 32-bit ones: the 3D renderer binds every texture as filterable)
+      const halve = !!(kind & 0x400) && !device.features.has('float32-filterable');
+      const texelBytes = kind & 0x400 && !halve ? 16 : kind & 0x600 ? 8 : 4;
+      const texFormat = bc ? bc.format : kind & 0x400 && !halve ? 'rgba32float' : kind & 0x600 ? 'rgba16float' : 'rgba8unorm';
+      const levels = Math.max(1, (kind >>> 16) & 31);
+      const faces = kind & 0x800 ? 6 : 1;
+      // Each mip's layout, one after another in the capture's bytes.
+      const mips = [];
+      let byteCount = 0;
+      for (let face = 0; face < faces; face++) {
+        for (let level = 0; level < levels; level++) {
+          const mw = Math.max(1, width >> level), mh = Math.max(1, height >> level);
+          const bytesPerRow = bc ? Math.ceil(mw / 4) * bc.bytes : mw * texelBytes;
+          const rows = bc ? Math.ceil(mh / 4) : mh;
+          const size = bc ? [Math.ceil(mw / 4) * 4, Math.ceil(mh / 4) * 4] : [mw, mh];
+          mips.push({ level, face, offset: byteCount, bytesPerRow, size });
+          byteCount += bytesPerRow * rows;
+        }
+      }
+      const upload = (texture, data) => {
+        for (const mip of mips) {
+          device.queue.writeTexture({ texture, mipLevel: mip.level, origin: [0, 0, mip.face] }, data,
+            { offset: mip.offset, bytesPerRow: mip.bytesPerRow }, mip.size);
+        }
+      };
+      // WebGPU will not read from shared memory: copy the pixels out first.
+      const copy = halve ? toHalf(new Float32Array(wasmMemory.buffer.slice(pixels, pixels + byteCount * 2)))
+                         : new Uint8Array(wasmMemory.buffer, pixels, byteCount).slice();
+      const old = slots[index];
+      if (old && old.width === width && old.height === height && old.format === texFormat && old.levels === levels &&
+          old.faces === faces) {
+        // Same size (the game rewrote it): update in place. Draws already
+        // recorded this frame see the new pixels, as on the console.
+        upload(old.texture, copy);
+        old.serial = serial;
+        return old.bind;
+      }
+      // Commands recorded this frame may still use the old one.
+      if (old) retiredTextures.push(old.texture);
+      const texture = device.createTexture({ size: [width, height, faces], format: texFormat, mipLevelCount: levels,
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      upload(texture, copy);
+      // (a cube map's view is a cube one, marked for the 3D renderer's bindings)
+      const view = faces === 6 ? Object.assign(texture.createView({ dimension: 'cube' }), { rexCube: true }) : texture.createView();
+      slots[index] = { serial, texture, width, height, format: texFormat, levels, faces,
+                       bind: faces === 6 ? whiteBind : bindFor(texture), view };
+      if (!bc && texelBytes === 4 && faces === 1 && location.search.includes('show2d') && thumbs++ < 48 && width >= 64) {
+        const thumb = document.createElement('canvas');
+        thumb.width = width; thumb.height = height;
+        thumb.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(copy.buffer, 0, width * height * 4), width, height), 0, 0);
+        const figure = document.createElement('figure');
+        figure.append(thumb, Object.assign(document.createElement('figcaption'),
+          { textContent: '#' + index + ' ' + width + 'x' + height + ' fmt ' + memory.getUint32(at + 20, true) }));
+        document.getElementById('thumbs').append(figure);
+      }
+      return slots[index].bind;
+    }
+
+    // A timer, not requestAnimationFrame: that one stops while the page is
+    // hidden, and a test page is often in the background.
+    function draw() {
+      const memory = new DataView(wasmMemory.buffer);
+      const frame = Number(Module._rex_web_frame());
+      const seq = memory.getUint32(frame, true);
+      if (seq === sequence) return;
+      sequence = seq;
+      const clear = memory.getUint32(frame + 4, true);
+      const quadCount = memory.getUint32(frame + 8, true);
+      const textureCount = memory.getUint32(frame + 12, true);
+      const quads = Number(memory.getBigUint64(frame + 16, true));
+      const table = Number(memory.getBigUint64(frame + 24, true));
+      const targetCount = memory.getUint32(frame + 32, true);
+      const screenBase = memory.getUint32(frame + 36, true);
+      const targetTable = Number(memory.getBigUint64(frame + 40, true));
+      const targetAt = {};  // base address -> table entry address
+      for (let t = 0; t < targetCount; t++) targetAt[memory.getUint32(targetTable + t * 32, true)] = targetTable + t * 32;
+      const encoder = device.createCommandEncoder();
+
+      // Draws `count` quads at `at` into `view` (width x height, cleared to
+      // `clearColor`), rendering any target they sample first.
+      function renderQuads(at, count, view, width, height, clearColor, depth) {
+        const vertices = new Float32Array(Math.max(count, 1) * 6 * 8);
+        const binds = [];
+        for (let q = 0; q < count; q++) {
+          const quad = at + q * 80;
+          const color = memory.getUint32(quad + 64, true), texture = memory.getUint32(quad + 68, true);
+          // D3DCOLOR: 0xAARRGGBB (text is 0xFFE1E1E1, its outline 0xFF000000).
+          const rgba = [((color >>> 16) & 255) / 255, ((color >>> 8) & 255) / 255,
+                        (color & 255) / 255, (color >>> 24) / 255];
+          [0, 1, 2, 2, 1, 3].forEach((corner, k) => {
+            const o = (q * 6 + k) * 8;
+            vertices[o] = memory.getFloat32(quad + corner * 4, true) / width * 2 - 1;
+            vertices[o + 1] = 1 - memory.getFloat32(quad + 16 + corner * 4, true) / height * 2;
+            vertices[o + 2] = memory.getFloat32(quad + 32 + corner * 4, true);
+            vertices[o + 3] = memory.getFloat32(quad + 48 + corner * 4, true);
+            vertices.set(rgba, o + 4);
+          });
+          if (texture & 0x80000000) binds.push(targetBind(texture & 0xFFFFF, depth + 1));
+          else binds.push(texture && texture <= textureCount ? syncTexture(memory, table, texture - 1) : whiteBind);
+        }
+        const buffer = device.createBuffer({ size: vertices.byteLength,
+          usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+        device.queue.writeBuffer(buffer, 0, vertices);
+        const pass = encoder.beginRenderPass({ colorAttachments: [{ view, loadOp: 'clear', storeOp: 'store',
+          clearValue: { r: (clearColor >>> 24) / 255, g: ((clearColor >>> 16) & 255) / 255,
+                        b: ((clearColor >>> 8) & 255) / 255, a: 1 } }] });
+        pass.setVertexBuffer(0, buffer);
+        let current = null;
+        for (let q = 0; q < count; q++) {
+          const quad = at + q * 80;
+          const state = pipelineFor(memory.getUint32(quad + 72, true), memory.getUint32(quad + 76, true));
+          if (state !== current) { pass.setPipeline(state); current = state; }
+          pass.setBindGroup(0, binds[q]);
+          pass.draw(6, 1, q * 6);
+        }
+        pass.end();
+        buffers.push(buffer);
+        return binds;
+      }
+      // A resolved target as a texture, re-rendered when it was resolved again.
+      function targetBind(base, depth) {
+        const at = targetAt[base];
+        if (at === undefined || depth > 4) return whiteBind;
+        const serial = memory.getUint32(at + 20, true);
+        const cached = targetTextures[base];
+        if (cached && cached.serial === serial) return cached.bind;
+        const width = memory.getUint32(at + 4, true), height = memory.getUint32(at + 8, true);
+        let entry = cached;
+        if (!entry || entry.width !== width || entry.height !== height) {
+          if (entry) entry.texture.destroy();
+          const texture = device.createTexture({ size: [width, height], format,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+          entry = targetTextures[base] = { texture, width, height, bind: bindFor(texture) };
+        }
+        entry.serial = serial;
+        renderQuads(Number(memory.getBigUint64(at + 24, true)), memory.getUint32(at + 16, true),
+                    entry.texture.createView(), width, height, memory.getUint32(at + 12, true), depth);
+        return entry.bind;
+      }
+
+      const buffers = [];
+      let binds = [];
+      const show2d = new URLSearchParams(location.search).has('show2d');
+      if (show2d) document.getElementById('screen').hidden = false;
+      if (screenBase && targetAt[screenBase] !== undefined) {
+        // The front buffer is a target: show it full screen.
+        const bind = targetBind(screenBase, 0);
+        const full = new Float32Array([-1, 1, 0, 0, 1, 1, 1, 1,  -1, -1, 0, 1, 1, 1, 1, 1,  1, 1, 1, 0, 1, 1, 1, 1,
+                                       1, 1, 1, 0, 1, 1, 1, 1,  -1, -1, 0, 1, 1, 1, 1, 1,  1, -1, 1, 1, 1, 1, 1, 1]);
+        const buffer = device.createBuffer({ size: full.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+        device.queue.writeBuffer(buffer, 0, full);
+        buffers.push(buffer);
+        const pass = encoder.beginRenderPass({ colorAttachments: [{ view: frameTexture.createView(),
+          loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
+        pass.setPipeline(pipeline); pass.setVertexBuffer(0, buffer); pass.setBindGroup(0, bind); pass.draw(6);
+        pass.end();
+        binds = [bind];
+      } else {
+        binds = renderQuads(quads, quadCount, frameTexture.createView(), 1280, 720, clear, 0);
+      }
+      if (show2d) encoder.copyTextureToTexture({ texture: frameTexture }, { texture: context.getCurrentTexture() },
+                                               [1280, 720]);
+      // The 3D scene, on its own canvas.
+      try {
+        Scene3D.render(memory, wasmMemory.buffer, frame, index => {
+          if (index >= textureCount) return null;
+          syncTexture(memory, table, index);
+          return slots[index] ? slots[index].view : null;
+        }, encoder);
+      } catch (e) {
+        if (!window.scene3dError) line('scene3d: ' + (window.scene3dError = e.stack || e), true);
+      }
+      // Splash, legal and loading screens mostly don't reach the 3D path (it
+      // records at most their backdrop): show the 2D compositor's picture
+      // whenever the 3D path drew no more than the 2D quads.
+      if (quadCount && (window.scene3dStats.drawn || 0) <= quadCount) {
+        Scene3D.presentTexture(encoder, frameTexture);
+      }
+      // The overlays (the hub, dialogs) on top.
+      const uiTransient = [];
+      WebUi.noteGameFrame();
+      WebUi.draw(encoder, Scene3D.canvasTexture().createView(), false, uiTransient);
+      const shot = Scene3D.captureCanvas(encoder);
+      const transient = (window.scene3dStats.transient || []).concat(retiredTextures, uiTransient);
+      retiredTextures = [];
+      // Save a PNG of each new kind of frame (its quad count and textures),
+      // up to 16, to the test server's uploads folder.
+      const signature = quadCount + ':' + [...new Set(binds)].length + ':' + screenBase + ':' + targetCount;
+      let readback = null;
+      // Save a frame every 1.5 s while the game draws (fades make the first
+      // frame of each screen black).
+      if (show2d && (quadCount || targetCount) && performance.now() - lastCaptureTime > 1500 && !capturing &&
+          captures < 24) {
+        lastCaptureTime = performance.now();
+        lastSignature = signature;
+        capturing = true;
+        readback = device.createBuffer({ size: 1280 * 720 * 4,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        encoder.copyTextureToBuffer({ texture: frameTexture }, { buffer: readback, bytesPerRow: 5120 },
+                                    [1280, 720]);
+      }
+      device.queue.submit([encoder.finish()]);
+      if (shot) shot();
+      device.queue.onSubmittedWorkDone().then(() => { buffers.forEach(b => b.destroy()); transient.forEach(b => b.destroy()); });
+      if (readback) {
+        const name = 'gta4-frame-' + String(++captures).padStart(2, '0') + '-q' + quadCount + '.png';
+        const described = [];
+        for (let q = 0; q < Math.min(quadCount, 6); q++) {
+          const at = quads + q * 80, f = k => memory.getFloat32(at + k, true).toFixed(0);
+          const tex = memory.getUint32(at + 68, true);
+          const size = tex & 0x80000000 ? 'target ' + (tex & 0xFFFFF).toString(16)
+                     : tex ? memory.getUint32(table + (tex - 1) * 24, true) + 'x' +
+                             memory.getUint32(table + (tex - 1) * 24 + 4, true) : 'none';
+          described.push('(' + f(0) + ',' + f(16) + ')-(' + f(12) + ',' + f(28) + ') c' +
+                         memory.getUint32(at + 64, true).toString(16) + ' tex ' + size + ' out ' +
+                         memory.getUint32(at + 72, true).toString(16) + ' blend ' + memory.getUint32(at + 76, true).toString(16));
+        }
+        line('web screen: ' + name + ' screen ' + screenBase.toString(16) + ' (' +
+             (targetAt[screenBase] !== undefined ? 'a target' : 'not a target') + ', ' + targetCount +
+             ' targets) quads: ' + described.join(' | '));
+        readback.mapAsync(GPUMapMode.READ).then(async () => {
+          const bgra = new Uint8Array(readback.getMappedRange()).slice();
+          readback.destroy();
+          for (let i = 0; i < bgra.length; i += 4) { const b = bgra[i]; bgra[i] = bgra[i + 2]; bgra[i + 2] = b; }
+          const canvas = new OffscreenCanvas(1280, 720);
+          canvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(bgra.buffer), 1280, 720), 0, 0);
+          const png = await canvas.convertToBlob({ type: 'image/png' });
+          await fetch('/upload/' + name, { method: 'POST', body: png });
+          line('web screen: saved ' + name);
+          capturing = false;
+        });
+      }
+      if (++frames === 1) line('web screen: first frame shown');
+      window.webLastQuads = quadCount;
+    }
+    // (the frame's header read: the game may publish into the other list -
+    // WebFrame::reading, after consumed)
+    Scene3D.onHeaderRead = () => {
+      if (sequence >= 0) Atomics.store(new Uint32Array(wasmMemory.buffer, Number(Module._rex_web_frame()) + 80, 1), 0, sequence);
+    };
+    // (often: a new frame is drawn as soon as the game has one)
+    setInterval(() => {
+      try { draw(); } catch (e) { if (!window.webDrawError) line('web screen: ' + (window.webDrawError = e.stack || e), true); }
+      // (done with this frame's data: the game may publish the next one -
+      // WebFrame::consumed, after front_target)
+      finally { if (sequence >= 0) Atomics.store(new Uint32Array(wasmMemory.buffer, Number(Module._rex_web_frame()) + 76, 1), 0, sequence); }
+    }, 4);
+  }
+</script>
+<script>
+  // The FPS counter (F8, or ?fps): frames shown a second, the game's own
+  // frames a second, and the last frame's 3D draws. Remembered per browser.
+  (() => {
+    const box = document.getElementById('fps');
+    let on = new URLSearchParams(location.search).has('fps');
+    try { on = on || localStorage.getItem('gta4-fps') === '1'; } catch (e) {}
+    box.hidden = !on;
+    addEventListener('keydown', e => {
+      if (e.code !== 'F8') return;
+      e.preventDefault(); e.stopImmediatePropagation();
+      if (e.repeat) return;
+      box.hidden = !box.hidden;
+      try { localStorage.setItem('gta4-fps', box.hidden ? '0' : '1'); } catch (err) {}
+    }, true);
+    addEventListener('keyup', e => { if (e.code === 'F8') { e.preventDefault(); e.stopImmediatePropagation(); } }, true);
+    let lastShown = 0, lastGame = 0, lastAt = performance.now();
+    setInterval(() => {
+      if (box.hidden) return;
+      const now = performance.now(), seconds = (now - lastAt) / 1000;
+      const log = window.s3dFrameLog || [];
+      const shown = log.length ? log[log.length - 1].serial : 0;
+      const game = typeof Module !== 'undefined' && Module._rex_web_present_count ? Module._rex_web_present_count() : 0;
+      const stats = window.scene3dStats || {};
+      box.textContent = `FPS ${Math.round((shown - lastShown) / seconds)}  game ${Math.round((game - lastGame) / seconds)}  ` +
+                        `${stats.drawn || 0} draws`;
+      lastShown = shown; lastGame = game; lastAt = now;
+    }, 500);
+  })();
+</script>
+<script src="record.js"></script>
+<script src="scene3d.js"></script>
+<script src="webui.js"></script>
+<script src="gta4.js"></script>
+<script src="gameinput.js"></script>
+<script src="demo.js"></script>
+</body>
+</html>

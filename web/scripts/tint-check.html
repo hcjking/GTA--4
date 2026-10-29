@@ -1,0 +1,18 @@
+<!doctype html><meta charset=utf-8><title>WGSL check</title><pre id=out>running</pre>
+<script type=module>
+const out = document.getElementById('out');
+const adapter = await navigator.gpu.requestAdapter();
+const device = await adapter.requestDevice({ requiredFeatures: adapter.features.has('clip-distances') ? ['clip-distances'] : [] });
+const names = (await (await fetch('wgsl/list.txt')).text()).trim().split('\n');
+const fails = {}; let ok = 0, bad = 0;
+for (const n of names) {
+  const code = await (await fetch('wgsl/' + n)).text();
+  const m = device.createShaderModule({ code });
+  const info = await m.getCompilationInfo();
+  const errs = info.messages.filter(x => x.type === 'error');
+  if (errs.length) { bad++; const k = errs[0].message.replace(/[0-9]+/g, 'N').slice(0, 140); (fails[k] ??= []).push(n); }
+  else ok++;
+}
+window.result = { ok, bad, fails: Object.fromEntries(Object.entries(fails).map(([k, v]) => [k, [v.length, v.slice(0, 2)]])) };
+out.textContent = JSON.stringify(window.result, null, 1);
+</script>

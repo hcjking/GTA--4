@@ -1,0 +1,24 @@
+# Ignore everything by default
+*
+
+# Track this file
+!.gitignore
+
+# Track button prompts directory (custom project assets)
+!button_prompts/
+!button_prompts/*/
+!button_prompts/**/*.xtd
+!button_prompts/**/*.dds
+!button_prompts/**/*.json
+
+# Never track copyrighted game files or build intermediates
+*.xex
+*.rpf
+*.iso
+*.xcp
+.DS_Store
+
+# [web port] the pause menu Controls pictures, rebuilt from the game's own
+# frontend_360.xtd (tools/xtd_tools/build_controller_diagrams.py): kept local
+button_prompts/*/frontend_360.xtd
+button_prompts/*/controls_*.bin
